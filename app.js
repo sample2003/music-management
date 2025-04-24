@@ -1,0 +1,323 @@
+const express = require('express');
+const fs = require('fs');
+const fsp = require('fs').promises;
+const path = require('path');
+const cors = require('cors');
+const mm = require('music-metadata');
+const mysql = require("mysql2/promise");
+
+const app = express();
+const musicFolder = path.join('L:\\text'); // 音乐文件夹路径
+const coverFolder = path.join('L:\\cover'); // 音乐文件夹路径
+const lyricsFolder = path.join('L:\\lyric'); // 音乐文件夹路径
+
+/**
+ * 配置
+ */
+// 启用 CORS
+app.use(cors());
+
+// 数据库配置
+const dbConfig = {
+  host: 'localhost',
+  port: 3307,
+  user: 'root',
+  password: '123456',
+  database: 'sample_music'
+};
+
+// api配置
+const API = "http://localhost"
+const PORT = process.env.PORT || 3000;
+const PATH = API + ":" + PORT
+
+/**
+ * 将元数据处理后加入数据库
+ *
+ */
+const pool = mysql.createPool({
+  ...dbConfig,
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
+});
+
+// 1.
+async function processMusicFiles() {
+  const connection = await pool.getConnection();
+  try {
+    const files = await getAllMusicFiles(musicFolder);
+    let processed = 0;
+    const total = files.length;
+    const startTime = Date.now();
+
+    for (const file of files) {
+      await saveToDatabase(connection, file);
+      processed++;
+
+      console.log(processed)
+      // 每处理10%或至少每10条输出进度
+      if (processed % Math.max(Math.floor(total/10), 10) === 0) {
+        const elapsed = ((Date.now() - startTime)/1000).toFixed(1);
+        console.log(`进度: ${processed}/${total} (${(processed/total*100).toFixed(1)}%) 已用 ${elapsed}s`);
+      }
+    }
+  } finally {
+    connection.release();
+  }
+}
+
+/**
+ * 解析音乐
+ *
+ */
+// 2. 处理音乐文件夹
+async function getAllMusicFiles(dir) {
+  const dirents = await fsp.readdir(dir, {withFileTypes: true});
+  const files = await Promise.all(dirents.map(async (dirent) => {
+    const resPath = path.resolve(dir, dirent.name);
+    if (dirent.isDirectory()) {
+      return getAllMusicFiles(resPath);
+    }
+    if (fileType(resPath) === 1) {
+      return parseSingleMusicFile(resPath, dir);
+    } else if (fileType(resPath) === 2) {
+      console.log("图片文件：" + resPath)
+    } else if (fileType(resPath) === 3) {
+      console.log("歌词文件：" + resPath)
+    } else {
+      console.log("无法识别该文件：" + resPath)
+    }
+  }));
+  return files.flat().filter(Boolean);
+}
+
+// 3. 检查文件类型
+function fileType(filePath) {
+  const songType = ['.mp3', '.wav', '.ogg', '.flac'];
+  const pictureType = ['.jpg', '.jpeg', '.png'];
+  const textType = ['.lrc', '.txt'];
+  if (songType.includes(path.extname(filePath).toLowerCase())) {
+    return 1;
+  } else if (pictureType.includes(path.extname(filePath).toLowerCase())) {
+    return 2;
+  } else if (textType.includes(path.extname(filePath).toLowerCase())) {
+    return 3;
+  } else {
+    return 0;
+  }
+}
+
+// 4. 解析单个音乐文件
+async function parseSingleMusicFile(filePath, dir) {
+  try {
+
+    const {common, format} = await mm.parseFile(filePath); // 使用 Promise 版本
+
+    // 获取封面格式
+    let coverUrl = '';
+    if (common.picture && common.picture.length > 0) {
+      const coverExt = common.picture[0].format.split('/')[1];
+      const coverPath = `${path.basename(filePath, path.extname(filePath))}.${coverExt}`;
+      coverUrl = PATH + "/api/cover?path=" + encodeURIComponent(coverPath)
+      await fsp.writeFile(path.join(coverFolder, coverPath), common.picture[0].data);
+    }
+
+    // 获取歌词
+    let lyricUrl = '';
+    if (common.lyrics && common.lyrics.length > 0) {
+      const lyricsPath = `${path.basename(filePath, path.extname(filePath))}.lrc`;
+      lyricUrl = PATH + "/api/lyric?path=" + encodeURIComponent(lyricsPath)
+      let lyricsContent = common.lyrics[0];
+
+      // 强制转换为UTF-8并添加BOM
+      const utf8Content = '\uFEFF' + lyricsContent.normalize('NFC');
+
+      await fsp.writeFile(path.join(lyricsFolder, lyricsPath), utf8Content, {
+        encoding: 'utf8',
+        flag: 'w'  // 强制覆盖已存在文件
+      });
+    }
+
+    // 获取歌曲地址
+    const ext = path.extname(filePath).toLowerCase();
+    const songPath = `${path.basename(filePath, path.extname(filePath))}${ext}`;
+    const songUrl = PATH + "/api/music/stream?path=" + encodeURIComponent(dir.split("L:\\text\\")[1] + "/" + songPath)
+
+    // 获取艺术家
+    let artist = ''
+    let artists = null;
+    if(common.artist !== null && common.artist.length > 0){
+      const str = common.artist;
+      const artistArray = str.split("&")
+      artist = artistArray[0]
+      if (artistArray.length > 1) {
+        artists = artistArray.slice(1).map(name => name.trim());
+      }
+    }
+
+    return {
+      title: common.title || path.basename(filePath, path.extname(filePath)),
+      artist: artist || '未知艺术家',
+      artists: artists,
+      album: common.album || '未知专辑',
+      duration: format.duration,
+      flac_url: songUrl,
+      file_size: (await fsp.stat(filePath)).size, // 使用 Promise 版本
+      cover: coverUrl,
+      lyric: lyricUrl,
+      year: common.year,
+      style: common.genre?.join(', ') || ''
+    }
+  } catch (error) {
+    console.error(`处理文件失败: ${filePath}`, error);
+    return null;
+  }
+}
+
+// 5. 将音乐数据存入数据库
+async function saveToDatabase(connection, song) {
+  try {
+    // 先查询是否已存在相同标题
+    const [existing] = await connection.execute(
+      'SELECT id FROM song_own WHERE title = ? LIMIT 1',
+      [song.title]
+    );
+
+    if (existing.length > 0) {
+      console.log(`跳过重复歌曲: ${song.title}`);
+      return;
+    }
+
+    await connection.execute(
+      `INSERT INTO song_own (title, artist, artists, album, flac_url, duration, cover, lyric, year) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        title = VALUES(title),
+        artist = VALUES(artist),
+        artists = VALUES(artists),
+        album = VALUES(album),
+        flac_url = VALUES(flac_url),
+        duration = VALUES(duration),
+        cover = VALUES(cover),
+        lyric = VALUES(lyric),
+        year = VALUES(year)`,
+      [
+        song.title, song.artist, song.artists, song.album, song.flac_url, song.duration, song.cover, song.lyric, song.year
+      ]
+    );
+  } catch (error) {
+    console.error('数据库保存失败:', error);
+  }
+}
+
+/**
+ * API
+ */
+
+// 解析音乐文件夹
+app.get('/api/music/parse', async (req, res) => {
+  try {
+    await processMusicFiles();
+    res.status(200).json({success: "解析音乐文件夹成功"})
+  } catch (error) {
+    res.status(500).json({error: '无法解析音乐文件夹'});
+  }
+});
+
+// 获取流式音乐
+app.get('/api/music/stream', async (req, res) => {
+  try {
+    const filePath = path.join(musicFolder, req.query.path);
+
+    if (!filePath.startsWith(musicFolder)) {
+      return res.status(400).send('无效的文件路径');
+    }
+
+    const stat = await fsp.stat(filePath); // 使用 Promise 版本
+    const fileExt = path.extname(filePath).toLowerCase();
+
+    const mimeTypes = {
+      '.mp3': 'audio/mpeg',
+      '.wav': 'audio/wav',
+      '.ogg': 'audio/ogg',
+      '.flac': 'audio/flac'
+    };
+
+    res.writeHead(200, {
+      'Content-Type': mimeTypes[fileExt] || 'audio/mpeg',
+      'Content-Length': stat.size
+    });
+
+    const readStream = fs.createReadStream(filePath); // 使用原始 fs
+    readStream.pipe(res);
+  } catch (error) {
+    res.status(404).send('文件未找到');
+  }
+});
+
+// 获取歌曲封面
+app.get('/api/cover', async (req, res) => {
+  try {
+    const param = req.query.path;
+
+    const fullPath = path.join(coverFolder, param);
+
+    // 防止路径遍历攻击
+    if (!fullPath.startsWith(path.resolve(coverFolder))) {
+      return res.status(400).json({error: '非法文件路径'});
+    }
+
+    // 5. 获取文件信息并返回
+    const stat = await fsp.stat(fullPath);
+    res.writeHead(200, {
+      // 'Content-Type': getImageMimeType(path.extname(fullPath)),
+      'Content-Type': 'jpg',
+      'Content-Length': stat.size
+    });
+
+    fs.createReadStream(fullPath).pipe(res);
+
+  } catch (error) {
+    console.error('封面获取错误:', error);
+    if (error.code === 'ENOENT') {
+      res.status(404).json({error: '封面文件不存在'});
+    } else {
+      res.status(500).json({error: '服务器内部错误'});
+    }
+  }
+});
+
+// 获取歌词
+app.get('/api/lyric', async (req, res) => {
+  try {
+    const param = req.query.path;
+
+    const fullPath = path.join(lyricsFolder, param);
+
+    // 防止路径遍历攻击
+    if (!fullPath.startsWith(path.resolve(lyricsFolder))) {
+      return res.status(400).json({error: '非法文件路径'});
+    }
+
+    // 5. 获取文件信息并返回
+    const stat = await fsp.stat(fullPath);
+    res.writeHead(200, {
+      'Content-Type': 'txt',
+      'Content-Length': stat.size
+    });
+
+    fs.createReadStream(fullPath).pipe(res);
+
+  } catch (error) {
+    console.error('歌词获取错误:', error);
+    if (error.code === 'ENOENT') {
+      res.status(404).json({error: '歌词文件不存在'});
+    } else {
+      res.status(500).json({error: '服务器内部错误'});
+    }
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`服务器运行在 ${API}:${PORT}`);
+});
