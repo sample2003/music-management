@@ -7,9 +7,9 @@ const mm = require('music-metadata');
 const mysql = require("mysql2/promise");
 
 const app = express();
-const musicFolder = path.join('L:\\text'); // 音乐文件夹路径
-const coverFolder = path.join('L:\\cover'); // 音乐文件夹路径
-const lyricsFolder = path.join('L:\\lyric'); // 音乐文件夹路径
+const musicFolder = path.join('L:\\text'); // 歌曲文件夹路径
+const coverFolder = path.join('L:\\cover'); // 封面文件夹路径
+const lyricsFolder = path.join('L:\\lyric'); // 歌词文件夹路径
 
 /**
  * 配置
@@ -55,11 +55,16 @@ async function processMusicFiles() {
       await saveToDatabase(connection, file);
       processed++;
 
-      console.log(processed)
       // 每处理10%或至少每10条输出进度
-      if (processed % Math.max(Math.floor(total/10), 10) === 0) {
+      // 修改日志触发条件为：
+      if (processed % 10 === 0 || processed === total) { // [!++]
         const elapsed = ((Date.now() - startTime)/1000).toFixed(1);
-        console.log(`进度: ${processed}/${total} (${(processed/total*100).toFixed(1)}%) 已用 ${elapsed}s`);
+        const percentage = (processed/total*100).toFixed(1);
+        console.log(`进度: ${processed}/${total} (${percentage}%) 已用 ${elapsed}s`);
+
+        // 添加预估剩余时间
+        const remaining = ((elapsed / processed) * (total - processed)).toFixed(1);
+        console.log(`预计剩余时间: ${remaining}s`); // [!++]
       }
     }
   } finally {
@@ -71,7 +76,7 @@ async function processMusicFiles() {
  * 解析音乐
  *
  */
-// 2. 处理音乐文件夹
+// 2. 处理歌曲文件夹
 async function getAllMusicFiles(dir) {
   const dirents = await fsp.readdir(dir, {withFileTypes: true});
   const files = await Promise.all(dirents.map(async (dirent) => {
@@ -108,10 +113,10 @@ function fileType(filePath) {
   }
 }
 
-// 4. 解析单个音乐文件
+// 4. 解析单个歌曲文件
 async function parseSingleMusicFile(filePath, dir) {
   try {
-
+    // console.log(await mm.parseFile(filePath))
     const {common, format} = await mm.parseFile(filePath); // 使用 Promise 版本
 
     // 获取封面格式
@@ -156,53 +161,107 @@ async function parseSingleMusicFile(filePath, dir) {
       }
     }
 
-    return {
+    let song = {
       title: common.title || path.basename(filePath, path.extname(filePath)),
       artist: artist || '未知艺术家',
       artists: artists,
       album: common.album || '未知专辑',
+      mp3_url: null,
+      flac_url: null,
+      bit_depth: null,
+      sampleRate: format.sampleRate,
       duration: format.duration,
-      flac_url: songUrl,
       file_size: (await fsp.stat(filePath)).size, // 使用 Promise 版本
       cover: coverUrl,
       lyric: lyricUrl,
       year: common.year,
       style: common.genre?.join(', ') || ''
     }
+
+    // 根据歌曲格式添加对应url字段
+    if (ext === '.mp3') {
+      song = {
+        ...song,
+        mp3_url: songUrl,
+      };
+    } else if (ext === '.flac') {
+      song = {
+        ...song,
+        flac_url: songUrl,
+        bit_depth: format.bitsPerSample || 16 // 添加位深度
+      };
+    }
+
+    return song;
   } catch (error) {
     console.error(`处理文件失败: ${filePath}`, error);
     return null;
   }
 }
 
-// 5. 将音乐数据存入数据库
+// 5. 将歌曲数据存入数据库
 async function saveToDatabase(connection, song) {
+  console.log(song.audio_features)
   try {
     // 先查询是否已存在相同标题
     const [existing] = await connection.execute(
-      'SELECT id FROM song_own WHERE title = ? LIMIT 1',
+      'SELECT id, title, artist, mp3_url, flac_url FROM song_own WHERE title = ? LIMIT 1',
       [song.title]
     );
 
-    if (existing.length > 0) {
-      console.log(`跳过重复歌曲: ${song.title}`);
+    if (existing.length > 0 && existing[0].artist === song.artist) {
+      if (song.mp3_url && existing[0].mp3_url === null) {
+        await connection.execute(
+          'UPDATE song_own SET mp3_url = ? WHERE id = ?',
+          [song.mp3_url, existing[0].id]
+        );
+      } else if (song.flac_url && existing[0].flac_url === null) {
+        await connection.execute(
+          'UPDATE song_own SET flac_url = ? WHERE id = ?',
+          [song.flac_url, existing[0].id]
+        );
+      } else {
+        console.log(`跳过重复歌曲: ${song.title}`);
+      }
       return;
     }
 
+    const [artistId] = await connection.execute(
+      'SELECT id FROM artist WHERE name = ?',
+      [song.artist]
+    );
+
+    if (artistId === null) {
+      await connection.execute(
+        'INSERT INTO artist (name) VALUES (?)', [song.artist]
+      );
+    }
+
+    const [albumId] = await connection.execute(
+      'SELECT id FROM album WHERE title = ?',
+      [song.album]
+    );
+
+
     await connection.execute(
-      `INSERT INTO song_own (title, artist, artists, album, flac_url, duration, cover, lyric, year) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+
+      `INSERT INTO song_own (title, artist, artists, album, mp3_url, flac_url, sampleRate, bit_depth, duration, cover, lyric, year) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
         title = VALUES(title),
         artist = VALUES(artist),
         artists = VALUES(artists),
         album = VALUES(album),
+        mp3_url = VALUES(mp3_url),
         flac_url = VALUES(flac_url),
+        sampleRate = VALUES(sampleRate),
+        bit_depth = VALUES(bit_depth),
         duration = VALUES(duration),
         cover = VALUES(cover),
         lyric = VALUES(lyric),
         year = VALUES(year)`,
       [
-        song.title, song.artist, song.artists, song.album, song.flac_url, song.duration, song.cover, song.lyric, song.year
+        song.title, song.artist, song.artists, song.album, song.mp3_url, song.flac_url, song.sampleRate, song.bit_depth, song.duration, song.cover, song.lyric, song.year
       ]
     );
   } catch (error) {
@@ -214,17 +273,27 @@ async function saveToDatabase(connection, song) {
  * API
  */
 
-// 解析音乐文件夹
+// 解析歌曲文件夹
 app.get('/api/music/parse', async (req, res) => {
   try {
     await processMusicFiles();
-    res.status(200).json({success: "解析音乐文件夹成功"})
+    res.status(200).json({success: "解析歌曲文件夹成功"})
   } catch (error) {
-    res.status(500).json({error: '无法解析音乐文件夹'});
+    res.status(500).json({error: '无法解析歌曲文件夹'});
   }
 });
 
-// 获取流式音乐
+// 解析单曲
+app.get('/api/music/single/parse', async (req, res) => {
+  try {
+    await processMusicFiles();
+    res.status(200).json({success: "解析歌曲文件夹成功"})
+  } catch (error) {
+    res.status(500).json({error: '无法解析歌曲文件夹'});
+  }
+});
+
+// 获取流式歌曲
 app.get('/api/music/stream', async (req, res) => {
   try {
     const filePath = path.join(musicFolder, req.query.path);
