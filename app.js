@@ -5,6 +5,7 @@ const path = require('path');
 const cors = require('cors');
 const mm = require('music-metadata');
 const mysql = require("mysql2/promise");
+const { analyzeAudioFeatures } = require('./parse');
 
 const app = express();
 const musicFolder = path.join('L:\\text'); // 歌曲文件夹路径
@@ -119,6 +120,15 @@ async function parseSingleMusicFile(filePath, dir) {
     // console.log(await mm.parseFile(filePath))
     const {common, format} = await mm.parseFile(filePath); // 使用 Promise 版本
 
+    let audioFeatures = {};
+    try {
+      audioFeatures = await analyzeAudioFeatures(filePath);
+      console.log(`音频特征分析成功: ${path.basename(filePath)}`);
+    } catch (error) {
+      console.error(`特征分析失败: ${filePath}`, error.message);
+    }
+    console.log(audioFeatures)
+
     // 获取封面格式
     let coverUrl = '';
     if (common.picture && common.picture.length > 0) {
@@ -161,6 +171,16 @@ async function parseSingleMusicFile(filePath, dir) {
       }
     }
 
+    // 获取歌曲特征
+    let features = {};
+    try {
+      features = await analyzeAudioFeatures(filePath);
+      console.log(`✅ 特征分析成功: ${path.basename(filePath)}`);
+    } catch (err) {
+      console.error(`❌ 特征分析失败: ${path.basename(filePath)}`, err.message);
+      features = { error: err.message };
+    }
+
     let song = {
       title: common.title || path.basename(filePath, path.extname(filePath)),
       artist: artist || '未知艺术家',
@@ -171,6 +191,7 @@ async function parseSingleMusicFile(filePath, dir) {
       bit_depth: null,
       sampleRate: format.sampleRate,
       duration: format.duration,
+      features: features,
       file_size: (await fsp.stat(filePath)).size, // 使用 Promise 版本
       cover: coverUrl,
       lyric: lyricUrl,
@@ -201,73 +222,96 @@ async function parseSingleMusicFile(filePath, dir) {
 
 // 5. 将歌曲数据存入数据库
 async function saveToDatabase(connection, song) {
-  console.log(song.audio_features)
+  // console.log(song.audio_features)
   try {
     // 先查询是否已存在相同标题
     const [existing] = await connection.execute(
-      'SELECT id, title, artist, mp3_url, flac_url FROM song_own WHERE title = ? LIMIT 1',
+      'SELECT id, title, artist_id, mp3_url, flac_url FROM song_own WHERE title = ? LIMIT 1',
       [song.title]
     );
 
-    if (existing.length > 0 && existing[0].artist === song.artist) {
-      if (song.mp3_url && existing[0].mp3_url === null) {
-        await connection.execute(
-          'UPDATE song_own SET mp3_url = ? WHERE id = ?',
-          [song.mp3_url, existing[0].id]
-        );
-      } else if (song.flac_url && existing[0].flac_url === null) {
-        await connection.execute(
-          'UPDATE song_own SET flac_url = ? WHERE id = ?',
-          [song.flac_url, existing[0].id]
-        );
-      } else {
-        console.log(`跳过重复歌曲: ${song.title}`);
+    // 存在相同标题情况
+    if (existing.length > 0) {
+      // 同时艺术家相同情况
+      const [artist] = await connection.execute(
+        'SELECT name FROM artist WHERE id = ? limit 1',
+        [existing[0].artist_id]
+      );
+      console.log(artist[0].name)
+      if (artist[0].name === song.artist) {
+        if (song.mp3_url && existing[0].mp3_url === null) {
+          await connection.execute(
+            'UPDATE song_own SET mp3_url = ? WHERE id = ?',
+            [song.mp3_url, existing[0].id]
+          );
+        } else if (song.flac_url && existing[0].flac_url === null) {
+          await connection.execute(
+            'UPDATE song_own SET flac_url = ? WHERE id = ?',
+            [song.flac_url, existing[0].id]
+          );
+        } else {
+          console.log(`跳过重复歌曲: ${song.title}`);
+        }
+        return;
       }
-      return;
     }
 
-    const [artistId] = await connection.execute(
-      'SELECT id FROM artist WHERE name = ?',
+    // 查询艺术家id
+    let artistId = null;
+    [artistId] = await connection.execute(
+      'SELECT id FROM artist WHERE name = ? limit 1',
       [song.artist]
     );
-
-    if (artistId === null) {
+    if (artistId[0] !== null) {
       await connection.execute(
         'INSERT INTO artist (name) VALUES (?)', [song.artist]
       );
+      [artistId] = await connection.execute(
+        'SELECT id FROM artist WHERE name = ? limit 1',
+        [song.artist]
+      )
     }
 
-    const [albumId] = await connection.execute(
+    // 查询专辑id
+    let albumId = null;
+    [albumId] = await connection.execute(
       'SELECT id FROM album WHERE title = ?',
       [song.album]
     );
+    if (albumId[0] !== null) {
+      await connection.execute(
+        'INSERT INTO album (title) VALUES (?)', [song.album]
+      );
+      [albumId] = await connection.execute(
+        'SELECT id FROM album WHERE title = ? limit 1',
+        [song.album]
+      )
+    }
 
-
+    // 插入数据至歌曲表
     await connection.execute(
+      `INSERT INTO song_own (title, artist_id, artists, album_id, mp3_url, flac_url, duration, cover, lyric, year) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [song.title, artistId[0].id, song.artists, albumId[0].id, song.mp3_url, song.flac_url, song.duration, song.cover, song.lyric, song.year]
+    );
+    const [songId] = await connection.execute(
+      'SELECT id FROM song WHERE title = ? and artist = ? limit 1',
+      [song.title, song.artist]
+    )
 
-      `INSERT INTO song_own (title, artist, artists, album, mp3_url, flac_url, sampleRate, bit_depth, duration, cover, lyric, year) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON DUPLICATE KEY UPDATE
-        title = VALUES(title),
-        artist = VALUES(artist),
-        artists = VALUES(artists),
-        album = VALUES(album),
-        mp3_url = VALUES(mp3_url),
-        flac_url = VALUES(flac_url),
-        sampleRate = VALUES(sampleRate),
-        bit_depth = VALUES(bit_depth),
-        duration = VALUES(duration),
-        cover = VALUES(cover),
-        lyric = VALUES(lyric),
-        year = VALUES(year)`,
-      [
-        song.title, song.artist, song.artists, song.album, song.mp3_url, song.flac_url, song.sampleRate, song.bit_depth, song.duration, song.cover, song.lyric, song.year
-      ]
+    console.log(song.features)
+
+    // 插入数据至歌曲特征表
+    await connection.execute(
+      `INSERT INTO song_feature (song_id, mfcc, tempo, sampleRate, bit_depth) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [songId[0].id, song.sampleRate, song.bit_depth]
     );
   } catch (error) {
     console.error('数据库保存失败:', error);
   }
 }
+
 
 /**
  * API
