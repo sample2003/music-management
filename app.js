@@ -92,7 +92,7 @@ async function getAllMusicFiles(dir) {
     } else if (fileType(resPath) === 3) {
       console.log("歌词文件：" + resPath)*/
     } else {
-      console.log("无法识别该文件：" + resPath)
+      console.log("非歌曲文件：" + resPath)
     }
   }));
   return files.flat().filter(Boolean);
@@ -325,7 +325,7 @@ async function saveToDatabase(connection, song) {
   try {
     // 先查询是否已存在相同标题
     const [existing] = await connection.execute(
-      'SELECT id, title, artist_id, mp3_url, flac_url FROM song_own WHERE title = ? LIMIT 1',
+      'SELECT id, title, artist_id, mp3_url, flac_url FROM song WHERE title = ? LIMIT 1',
       [song.title]
     );
 
@@ -339,12 +339,12 @@ async function saveToDatabase(connection, song) {
       if (artist[0].name === song.artist) {
         if (song.mp3_url && existing[0].mp3_url === null) {
           await connection.execute(
-            'UPDATE song_own SET mp3_url = ? WHERE id = ?',
+            'UPDATE song SET mp3_url = ? WHERE id = ?',
             [song.mp3_url, existing[0].id]
           );
         } else if (song.flac_url && existing[0].flac_url === null) {
           await connection.execute(
-            'UPDATE song_own SET flac_url = ? WHERE id = ?',
+            'UPDATE song SET flac_url = ? WHERE id = ?',
             [song.flac_url, existing[0].id]
           );
         } else {
@@ -396,7 +396,7 @@ async function saveToDatabase(connection, song) {
 
     // 插入数据至歌曲表
     await connection.execute(
-      `INSERT INTO song_own (title, artist_id, artists, album_id, mp3_url, flac_url, duration, cover, lyric, year) 
+      `INSERT INTO song (title, artist_id, artists, album_id, mp3_url, flac_url, duration, cover, lyric, year) 
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [song.title, artistId, song.artists, albumId, song.mp3_url, song.flac_url, song.duration, song.cover, song.lyric, song.year]
     );
