@@ -468,27 +468,96 @@ app.get('/api/music/single/parse', async (req, res) => {
 // 获取流式歌曲
 app.get('/api/music/stream', async (req, res) => {
   try {
-    const filePath = path.join(BASE_PATH, req.query.path);
+    // 设置CORS头部
+    res.set({
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Expose-Headers': 'Content-Length, Content-Range',
+      'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+      'Access-Control-Allow-Headers': 'Range'
+    });
 
-    const stat = await fsp.stat(filePath); // 使用 Promise 版本
+    // 处理预检请求
+    if (req.method === 'OPTIONS') {
+      return res.status(204).end();
+    }
+
+    // 安全获取文件路径
+    const safePath = path.normalize(req.query.path).replace(/^(\.\.(\/|\\|$))+/g, '');
+    const filePath = path.join(BASE_PATH, safePath);
+
+    // 获取文件信息（fileSize来源）
+    const stat = await fsp.stat(filePath);
+    const fileSize = stat.size; // 文件大小（字节数）
+
+    // 获取文件扩展名
     const fileExt = path.extname(filePath).toLowerCase();
 
+    // MIME类型映射（contentType来源）
     const mimeTypes = {
       '.mp3': 'audio/mpeg',
       '.wav': 'audio/wav',
       '.ogg': 'audio/ogg',
-      '.flac': 'audio/flac'
+      '.flac': 'audio/flac',
+      '.m4a': 'audio/mp4',
+      '.aac': 'audio/aac'
     };
 
-    res.writeHead(200, {
-      'Content-Type': mimeTypes[fileExt] || 'audio/mpeg',
-      'Content-Length': stat.size
-    });
+    // 确定内容类型
+    const contentType = mimeTypes[fileExt] || 'audio/mpeg';
 
-    const readStream = fs.createReadStream(filePath); // 使用原始 fs
-    readStream.pipe(res);
+    // 获取范围请求头
+    const rangeHeader = req.headers.range;
+
+    // 支持范围请求
+    if (rangeHeader) {
+      // 解析范围请求
+      const parts = rangeHeader.replace(/bytes=/, "").split("-");
+      const start = parseInt(parts[0], 10);
+      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+
+      // 验证范围有效性
+      if (start >= fileSize || end >= fileSize) {
+        res.writeHead(416, {
+          'Content-Range': `bytes */${fileSize}`
+        });
+        return res.end();
+      }
+
+      const chunkSize = end - start + 1;
+
+      // 设置部分内容响应头
+      res.writeHead(206, {
+        'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+        'Accept-Ranges': 'bytes',
+        'Content-Length': chunkSize,
+        'Content-Type': contentType
+      });
+
+      // 创建部分文件流
+      const readStream = fs.createReadStream(filePath, { start, end });
+      readStream.pipe(res);
+    }
+    // 不支持范围请求时发送整个文件
+    else {
+      res.writeHead(200, {
+        'Content-Length': fileSize,
+        'Content-Type': contentType,
+        'Accept-Ranges': 'bytes' // 告知客户端支持范围请求
+      });
+
+      fs.createReadStream(filePath).pipe(res);
+    }
   } catch (error) {
-    res.status(404).send('文件未找到');
+    console.error('流媒体错误:', error);
+
+    // 精确错误处理
+    if (error.code === 'ENOENT') {
+      res.status(404).send('文件未找到');
+    } else if (error.code === 'EACCES') {
+      res.status(403).send('无访问权限');
+    } else {
+      res.status(500).send('服务器错误');
+    }
   }
 });
 
